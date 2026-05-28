@@ -43,6 +43,18 @@ Single signal-cli child process — bidirectional stdio JSON-RPC — sidesteps s
 
 The trigger word on note-to-self prevents the daemon from replying to every personal note you make.
 
+## Conversation memory
+
+Each "channel" (the home-line thread and the note-to-self thread) keeps its own persistent Claude session, so the agent remembers what was said earlier in that thread across daemon restarts and machine reboots.
+
+- First message in a channel: daemon generates a UUID and invokes `claude -p --session-id <uuid>` to create a new session.
+- Subsequent messages: `claude -p --resume <uuid>` continues the same conversation, accumulating turns.
+- If `--resume` ever fails (session expired or deleted), the daemon mints a fresh UUID and starts over.
+
+The mapping `{channel: session_id}` lives in `$SESSIONS_FILE` (default `$STATE_DIR/sessions.json`). The home-line thread and the note-to-self thread are independent — Claude won't cross-pollute them.
+
+> Note: this is conversation context, not long-term memory. Claude Code's own memory system at `~/.claude/projects/.../memory/` runs alongside and persists facts across *all* sessions.
+
 ## Prerequisites
 
 - Python 3.10+ (uses `subprocess`, `threading`, `json` — stdlib only)

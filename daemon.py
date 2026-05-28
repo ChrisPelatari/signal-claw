@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from queue import Queue, Empty
 
@@ -45,6 +46,7 @@ LOG_FILE       = Path(env("LOG_FILE", str(STATE_DIR / "daemon.log")))
 CLAUDE_TIMEOUT = int(env("CLAUDE_TIMEOUT", "240"))
 SIGNAL_RETRY   = int(env("SIGNAL_RETRY", "5"))
 MAX_REPLY_LEN  = int(env("MAX_REPLY_LEN", "3800"))
+SESSIONS_FILE  = Path(env("SESSIONS_FILE", str(STATE_DIR / "sessions.json")))
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -153,14 +155,66 @@ def has_trigger(body: str) -> bool:
            body.lstrip().lower().startswith(f"@{TRIGGER_WORD}")
 
 
-def run_claude(prompt: str) -> str:
+_sessions_lock = threading.Lock()
+
+
+def load_sessions() -> dict[str, str]:
     try:
-        proc = subprocess.run(
-            [CLAUDE, "-p", prompt],
-            capture_output=True, text=True,
-            timeout=CLAUDE_TIMEOUT,
-            cwd=str(Path.home()),
-        )
+        with SESSIONS_FILE.open() as f:
+            data = json.load(f)
+            return {k: v for k, v in data.items() if isinstance(v, str)}
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("sessions file unreadable, starting fresh: %s", e)
+        return {}
+
+
+def save_sessions(sessions: dict[str, str]) -> None:
+    try:
+        tmp = SESSIONS_FILE.with_suffix(".json.tmp")
+        with tmp.open("w") as f:
+            json.dump(sessions, f, indent=2, sort_keys=True)
+        tmp.replace(SESSIONS_FILE)
+    except OSError as e:
+        log.error("failed to save sessions: %s", e)
+
+
+def _invoke_claude(args: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [CLAUDE, "-p", prompt, *args],
+        capture_output=True, text=True,
+        timeout=CLAUDE_TIMEOUT,
+        cwd=str(Path.home()),
+    )
+
+
+def run_claude(prompt: str, channel: str) -> str:
+    """Invoke claude with persistent per-channel session memory.
+
+    First message in a channel: --session-id <new uuid> (creates the session).
+    Subsequent messages: --resume <uuid> (continues the same conversation).
+    If --resume fails (session deleted/expired), recover by minting a fresh UUID.
+    """
+    with _sessions_lock:
+        sessions = load_sessions()
+        existing = sessions.get(channel)
+
+    try:
+        if existing:
+            proc = _invoke_claude(["--resume", existing], prompt)
+            if proc.returncode != 0 and ("not found" in (proc.stderr or "").lower()
+                                          or "no such session" in (proc.stderr or "").lower()):
+                log.warning("session %s lost for channel=%s, restarting", existing, channel)
+                existing = None  # fall through to creation path
+        if not existing:
+            new_id = str(uuid.uuid4())
+            proc = _invoke_claude(["--session-id", new_id], prompt)
+            with _sessions_lock:
+                sessions = load_sessions()
+                sessions[channel] = new_id
+                save_sessions(sessions)
+
         out = (proc.stdout or "").strip()
         if not out:
             out = (proc.stderr or "").strip() or "(claude returned no output)"
@@ -192,8 +246,9 @@ def handle(params: dict, rpc: SignalRpc) -> None:
         return
 
     src = envelope.get("source")
-    log.info("prompt src=%s nts=%s body=%r", src, nts, prompt[:200])
-    reply = truncate(run_claude(prompt))
+    channel = "nts" if nts else f"homeline:{target}"
+    log.info("prompt src=%s channel=%s body=%r", src, channel, prompt[:200])
+    reply = truncate(run_claude(prompt, channel))
     log.info("reply len=%d -> %s", len(reply), "note-to-self" if nts else target)
 
     if nts:
