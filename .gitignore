@@ -1,0 +1,17 @@
+# Per-machine secrets / config — never commit
+config.env
+
+# Local state, logs, signal-cli data
+*.log
+state/
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
