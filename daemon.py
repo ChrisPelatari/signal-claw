@@ -7,10 +7,18 @@ multiplexes incoming-message notifications and outgoing-send requests over
 that single process. This avoids signal-cli's per-account database lock,
 which prevents a second send invocation while a receive is active.
 
-Routing rules:
-  - Direct message from $SIGNAL_HOMELINE                    -> wake claude, reply to home line.
-  - Note-to-self whose body starts with $TRIGGER_WORD        -> wake claude, reply via note-to-self.
-  - Everything else                                          -> log and ignore.
+Routing rules (both homeline DMs and note-to-self share these):
+  - Body normalized to 'pulse-agents' (bare OR after prefix strip)
+        -> render local dashboard, reply directly (no claude spawn).
+  - Body starts with '<TRIGGER_WORD>@<HOSTNAME>' (case-insensitive, optional
+    ':' / ',' / '-' / whitespace separator)
+        -> strip prefix, wake claude, reply to the source channel.
+  - Everything else -> log and drop silently.
+
+The prefix gate exists so one Signal account can be linked to many machines
+without every machine answering every message. Each host only responds to
+messages explicitly addressed to it. `pulse-agents` is the deliberate
+exception: fleet-wide pings answered by every relay simultaneously.
 
 All configuration is taken from environment variables (see config.example.env).
 """
@@ -19,6 +27,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import socket
 import subprocess
 import sys
 import threading
@@ -39,6 +49,7 @@ def env(key: str, default: str | None = None, *, required: bool = False) -> str:
 ACCOUNT        = env("SIGNAL_ACCOUNT", required=True)
 HOMELINE       = env("SIGNAL_HOMELINE", required=True)
 TRIGGER_WORD   = env("TRIGGER_WORD", "claude").lower()
+HOSTNAME       = env("SIGNAL_HOSTNAME", socket.gethostname().split(".", 1)[0]).strip().lower()
 SIGNAL_CLI     = env("SIGNAL_CLI", "/usr/bin/signal-cli")
 CLAUDE         = env("CLAUDE", "/usr/bin/claude")
 STATE_DIR      = Path(env("STATE_DIR", str(Path.home() / ".local/share/signal-claude")))
@@ -47,6 +58,12 @@ CLAUDE_TIMEOUT = int(env("CLAUDE_TIMEOUT", "240"))
 SIGNAL_RETRY   = int(env("SIGNAL_RETRY", "5"))
 MAX_REPLY_LEN  = int(env("MAX_REPLY_LEN", "3800"))
 SESSIONS_FILE  = Path(env("SESSIONS_FILE", str(STATE_DIR / "sessions.json")))
+
+PREFIX_RE = re.compile(
+    rf"^{re.escape(TRIGGER_WORD)}@{re.escape(HOSTNAME)}\b[\s:,\-]*",
+    re.IGNORECASE,
+)
+PULSE_TRIGGER = "pulse-agents"
 
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
@@ -141,18 +158,90 @@ def extract(envelope: dict) -> tuple[str | None, str | None, bool]:
     return None, None, False
 
 
-def strip_trigger(body: str) -> str:
+def match_prefix(body: str) -> tuple[bool, str]:
+    """Return (matched, body-with-prefix-removed). Empty residue is allowed."""
     s = body.lstrip()
-    low = s.lower()
-    for prefix in (f"@{TRIGGER_WORD}", f"{TRIGGER_WORD}:", f"{TRIGGER_WORD},", TRIGGER_WORD):
-        if low.startswith(prefix):
-            return s[len(prefix):].lstrip(" :,-")
-    return body
+    m = PREFIX_RE.match(s)
+    if not m:
+        return False, body
+    return True, s[m.end():]
 
 
-def has_trigger(body: str) -> bool:
-    return body.lstrip().lower().startswith(TRIGGER_WORD) or \
-           body.lstrip().lower().startswith(f"@{TRIGGER_WORD}")
+def normalize_trigger(text: str) -> str:
+    """Collapse whitespace + lowercase so 'Pulse Agents' == 'pulse-agents'... almost.
+
+    We strip whitespace entirely, so 'PULSE-AGENTS', 'pulse  agents', and 'Pulse-Agents'
+    all collapse to 'pulse-agents'. Hyphens are preserved.
+    """
+    return "".join(text.lower().split())
+
+
+def render_pulse() -> str:
+    """Return a one-line dashboard for fleet-wide 'pulse-agents' pings.
+
+    Reads /proc directly to avoid forking df/uptime/free. Falls back to '?' on
+    any parse error so we never fail to reply.
+    """
+    host = socket.gethostname().split(".", 1)[0]
+
+    def _read(path: str) -> str:
+        try:
+            return Path(path).read_text()
+        except OSError:
+            return ""
+
+    try:
+        up_s = float(_read("/proc/uptime").split()[0])
+        d, rem = divmod(int(up_s), 86400)
+        h, rem = divmod(rem, 3600)
+        m, _ = divmod(rem, 60)
+        uptime = f"{d}d{h:02d}h{m:02d}m" if d else f"{h}h{m:02d}m"
+    except (ValueError, IndexError):
+        uptime = "?"
+
+    load_parts = _read("/proc/loadavg").split()
+    load = " ".join(load_parts[:3]) if len(load_parts) >= 3 else "?"
+
+    try:
+        meminfo: dict[str, int] = {}
+        for line in _read("/proc/meminfo").splitlines():
+            key, _, rest = line.partition(":")
+            if rest:
+                meminfo[key.strip()] = int(rest.strip().split()[0])
+        total_g = meminfo["MemTotal"] / 1024 / 1024
+        avail_g = meminfo.get("MemAvailable", meminfo["MemTotal"]) / 1024 / 1024
+        mem = f"{total_g - avail_g:.1f}/{total_g:.1f}G"
+    except (KeyError, ValueError):
+        mem = "?"
+
+    try:
+        st = os.statvfs("/")
+        total_g = st.f_blocks * st.f_frsize / 1024**3
+        free_g  = st.f_bavail * st.f_frsize / 1024**3
+        used_g  = total_g - free_g
+        pct = int(round(used_g / total_g * 100)) if total_g else 0
+        disk = f"{used_g:.0f}/{total_g:.0f}G ({pct}%)"
+    except OSError:
+        disk = "?"
+
+    return f"{host} · up {uptime} · load {load} · mem {mem} · root {disk}"
+
+
+def fast_path_pulse_agents(body: str, target: str, nts: bool, rpc: "SignalRpc") -> bool:
+    """If body == 'pulse-agents' (normalized), render+send and return True."""
+    if normalize_trigger(body) != PULSE_TRIGGER:
+        return False
+    try:
+        reply = render_pulse()
+    except Exception as e:
+        log.exception("pulse render failed")
+        reply = f"({HOSTNAME}: pulse render failed: {e})"
+    if nts:
+        rpc.send(note_to_self=True, message=reply)
+    else:
+        rpc.send(recipient=target, message=reply)
+    log.info("fast-path pulse-agents -> %s", "note-to-self" if nts else target)
+    return True
 
 
 _sessions_lock = threading.Lock()
@@ -237,15 +326,25 @@ def handle(params: dict, rpc: SignalRpc) -> None:
     if not body or not target:
         return
 
-    if nts and not has_trigger(body):
-        return
-
-    prompt = strip_trigger(body) if nts else body
-    if not prompt.strip():
-        log.info("empty prompt after trigger strip nts=%s", nts)
-        return
-
     src = envelope.get("source")
+
+    if fast_path_pulse_agents(body, target, nts, rpc):
+        return
+
+    matched, stripped = match_prefix(body)
+    if not matched:
+        log.info("dropped (no %s@%s prefix) src=%s body=%r",
+                 TRIGGER_WORD, HOSTNAME, src, body[:80])
+        return
+
+    if fast_path_pulse_agents(stripped, target, nts, rpc):
+        return
+
+    prompt = stripped.strip()
+    if not prompt:
+        log.info("dropped (empty after prefix strip) src=%s", src)
+        return
+
     channel = "nts" if nts else f"homeline:{target}"
     log.info("prompt src=%s channel=%s body=%r", src, channel, prompt[:200])
     reply = truncate(run_claude(prompt, channel))

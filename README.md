@@ -35,13 +35,23 @@ Single signal-cli child process — bidirectional stdio JSON-RPC — sidesteps s
 
 ## Routing rules
 
-| Incoming                                              | Action                                |
-|-------------------------------------------------------|---------------------------------------|
-| Direct message from `$SIGNAL_HOMELINE`                | `claude -p $body` → reply to homeline |
-| Note-to-self starting with `$TRIGGER_WORD`            | `claude -p $body` → reply via NtS     |
-| Anything else                                         | log and ignore                        |
+| Incoming                                                                 | Action                                |
+|--------------------------------------------------------------------------|---------------------------------------|
+| Anything normalized to `pulse-agents` (bare or after prefix strip)       | render local one-line dashboard → reply to source (no claude spawn) |
+| DM from `$SIGNAL_HOMELINE` starting with `$TRIGGER_WORD@$HOSTNAME`       | strip prefix → `claude -p $body` → reply to homeline |
+| Note-to-self starting with `$TRIGGER_WORD@$HOSTNAME`                     | strip prefix → `claude -p $body` → reply via NtS     |
+| Anything else                                                            | log and drop silently                 |
 
-The trigger word on note-to-self prevents the daemon from replying to every personal note you make.
+The per-host prefix (`claude@jiraiya`, `claude@itachi`, …) exists so the same Signal account can be linked to many machines without every relay answering every message. Each host only responds to messages addressed to it.
+
+`pulse-agents` is the deliberate exception — a fleet-wide ping where every relay answers with its own dashboard. This is how you snapshot CPU/RAM/disk across the whole fleet from one Signal thread.
+
+Prefix matching is case-insensitive, with optional `:`, `,`, `-`, or whitespace between the prefix and the body. So all of these work:
+
+- `claude@jiraiya status`
+- `Claude@JIRAIYA: status`
+- `claude@jiraiya, status`
+- `  claude@jiraiya  status  `
 
 ## Conversation memory
 
