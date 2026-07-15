@@ -192,6 +192,18 @@ def extract(envelope: dict) -> tuple[str | None, str | None, str | None]:
     if data_msg.get("message") and SASUKE_GROUP and group_info.get("groupId") == SASUKE_GROUP:
         return SASUKE_GROUP, data_msg["message"], "group"
 
+    # Kurama gap: a send into the Sasuke group from the account's own phone
+    # (the primary device) arrives as a *sync* message, not a dataMessage.
+    # Route it like a group prompt — but only when sourceDevice is 1 (the
+    # phone). Syncs from other linked devices are replies/relays from sibling
+    # bridge daemons; routing those would let two bridges prompt each other
+    # in an infinite loop.
+    sync_group = (sync_sent.get("groupInfo") or {}).get("groupId")
+    if (sync_sent.get("message") and SASUKE_GROUP
+            and sync_group == SASUKE_GROUP
+            and envelope.get("sourceDevice") == 1):
+        return SASUKE_GROUP, sync_sent["message"], "group"
+
     # Direct 1:1 message from the trusted home line (not a group).
     if data_msg.get("message") and src == HOMELINE and not group_info:
         return HOMELINE, data_msg["message"], "homeline"
