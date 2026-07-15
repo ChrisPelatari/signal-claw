@@ -58,6 +58,10 @@ CLAUDE_TIMEOUT = int(env("CLAUDE_TIMEOUT", "240"))
 SIGNAL_RETRY   = int(env("SIGNAL_RETRY", "5"))
 MAX_REPLY_LEN  = int(env("MAX_REPLY_LEN", "3800"))
 SESSIONS_FILE  = Path(env("SESSIONS_FILE", str(STATE_DIR / "sessions.json")))
+SASUKE_GROUP      = env("SASUKE_GROUP", "").strip()      # base64 groupId; msgs in this group bypass the prefix
+CLAUDE_CONFIG_DIR = env("CLAUDE_CONFIG_DIR", "").strip()  # set → claude runs as the LifeOS DA (Sasuke)
+WATCHDOG_PROBE    = int(env("WATCHDOG_PROBE", "300"))    # seconds between rpc liveness probes
+WATCHDOG_STALE    = int(env("WATCHDOG_STALE", "14400"))  # recycle signal-cli after this long with no inbound traffic
 
 PREFIX_RE = re.compile(
     rf"^{re.escape(TRIGGER_WORD)}@{re.escape(HOSTNAME)}\b[\s:,\-]*",
@@ -82,6 +86,11 @@ class SignalRpc:
         self.next_id = 1
         self.send_lock = threading.Lock()
         self.events: Queue[dict] = Queue()
+        self.pending: dict[int, Queue[dict]] = {}
+        # Inbound-traffic clock: receive events + stderr lines only. Probe
+        # responses deliberately do NOT reset it, or the stale check could
+        # never fire — a wedged ReceiveHelper still answers local rpc calls.
+        self.last_inbound = time.time()
 
     def start(self) -> None:
         self.proc = subprocess.Popen(
@@ -108,19 +117,48 @@ class SignalRpc:
                 log.warning("non-json stdout: %s", line[:200])
                 continue
             if msg.get("method") == "receive":
+                self.last_inbound = time.time()
                 self.events.put(msg.get("params") or {})
-            elif "id" in msg and "error" in msg:
-                log.error("signal-cli rpc error id=%s err=%s", msg.get("id"), msg["error"])
+            elif "id" in msg:
+                waiter = self.pending.pop(msg["id"], None)
+                if waiter is not None:
+                    waiter.put(msg)
+                elif "error" in msg:
+                    log.error("signal-cli rpc error id=%s err=%s", msg.get("id"), msg["error"])
 
     def _stderr_reader(self) -> None:
         assert self.proc and self.proc.stderr
         for line in self.proc.stderr:
             line = line.rstrip()
             if line:
+                self.last_inbound = time.time()
                 log.info("[signal-cli] %s", line[-400:])
 
+    def probe(self, timeout: float = 30.0) -> bool:
+        """Round-trip a 'version' rpc call. False = signal-cli is wedged."""
+        if not self.proc or not self.proc.stdin or self.proc.poll() is not None:
+            return False
+        waiter: Queue[dict] = Queue(maxsize=1)
+        with self.send_lock:
+            req_id = self.next_id
+            self.next_id += 1
+            self.pending[req_id] = waiter
+            req = {"jsonrpc": "2.0", "method": "version", "id": req_id}
+            try:
+                self.proc.stdin.write(json.dumps(req) + "\n")
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self.pending.pop(req_id, None)
+                return False
+        try:
+            waiter.get(timeout=timeout)
+            return True
+        except Empty:
+            self.pending.pop(req_id, None)
+            return False
+
     def send(self, *, recipient: str | None = None, note_to_self: bool = False,
-             message: str) -> None:
+             group_id: str | None = None, message: str) -> None:
         if not self.proc or not self.proc.stdin:
             log.error("send called before start()")
             return
@@ -128,7 +166,9 @@ class SignalRpc:
             req_id = self.next_id
             self.next_id += 1
             params: dict = {"message": message}
-            if note_to_self:
+            if group_id:
+                params["groupId"] = group_id
+            elif note_to_self:
                 params["noteToSelf"] = True
             else:
                 params["recipient"] = [recipient]
@@ -140,22 +180,29 @@ class SignalRpc:
                 log.error("send: broken pipe to signal-cli")
 
 
-def extract(envelope: dict) -> tuple[str | None, str | None, bool]:
-    """Return (reply_target, body, is_note_to_self) or (None, None, False) to skip."""
+def extract(envelope: dict) -> tuple[str | None, str | None, str | None]:
+    """Return (reply_target, body, kind) with kind 'group'|'homeline'|'nts', or (None, None, None)."""
     src = envelope.get("source") or envelope.get("sourceNumber")
 
     data_msg = envelope.get("dataMessage") or {}
     sync_sent = ((envelope.get("syncMessage") or {}).get("sentMessage")) or {}
+    group_info = data_msg.get("groupInfo") or {}
 
-    if data_msg.get("message") and src == HOMELINE:
-        return HOMELINE, data_msg["message"], False
+    # Dedicated Sasuke group: any message here (from anyone) is for us; reply into the group.
+    if data_msg.get("message") and SASUKE_GROUP and group_info.get("groupId") == SASUKE_GROUP:
+        return SASUKE_GROUP, data_msg["message"], "group"
 
-    if sync_sent.get("message"):
+    # Direct 1:1 message from the trusted home line (not a group).
+    if data_msg.get("message") and src == HOMELINE and not group_info:
+        return HOMELINE, data_msg["message"], "homeline"
+
+    # Note-to-self (1:1 self sync, not a group sync).
+    if sync_sent.get("message") and not sync_sent.get("groupInfo"):
         dest = sync_sent.get("destination") or sync_sent.get("destinationNumber")
         if dest == ACCOUNT:
-            return ACCOUNT, sync_sent["message"], True
+            return ACCOUNT, sync_sent["message"], "nts"
 
-    return None, None, False
+    return None, None, None
 
 
 def match_prefix(body: str) -> tuple[bool, str]:
@@ -270,11 +317,15 @@ def save_sessions(sessions: dict[str, str]) -> None:
 
 
 def _invoke_claude(args: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
+    child_env = dict(os.environ)
+    if CLAUDE_CONFIG_DIR:
+        child_env["CLAUDE_CONFIG_DIR"] = CLAUDE_CONFIG_DIR   # run as the LifeOS DA (Sasuke)
     return subprocess.run(
         [CLAUDE, "-p", prompt, *args],
         capture_output=True, text=True,
         timeout=CLAUDE_TIMEOUT,
         cwd=str(Path.home()),
+        env=child_env,
     )
 
 
@@ -322,11 +373,25 @@ def truncate(text: str, n: int = MAX_REPLY_LEN) -> str:
 
 def handle(params: dict, rpc: SignalRpc) -> None:
     envelope = params.get("envelope") or {}
-    target, body, nts = extract(envelope)
-    if not body or not target:
+    target, body, kind = extract(envelope)
+    if not body or not kind:
         return
 
     src = envelope.get("source")
+
+    # Dedicated Sasuke group: the group IS the filter — no trigger prefix required.
+    if kind == "group":
+        prompt = body.strip()
+        if not prompt:
+            return
+        channel = f"group:{target}"
+        log.info("group prompt src=%s body=%r", src, prompt[:200])
+        reply = truncate(run_claude(prompt, channel))
+        log.info("reply len=%d -> group", len(reply))
+        rpc.send(group_id=target, message=reply)
+        return
+
+    nts = (kind == "nts")
 
     if fast_path_pulse_agents(body, target, nts, rpc):
         return
@@ -368,13 +433,26 @@ def main() -> None:
             continue
 
         try:
+            last_probe = time.time()
             while True:
                 try:
                     params = rpc.events.get(timeout=5)
                 except Empty:
-                    if rpc.proc and rpc.proc.poll() is not None:
-                        log.warning("signal-cli exited code=%s", rpc.proc.returncode)
+                    params = None
+                if rpc.proc and rpc.proc.poll() is not None:
+                    log.warning("signal-cli exited code=%s", rpc.proc.returncode)
+                    break
+                now = time.time()
+                if now - last_probe >= WATCHDOG_PROBE:
+                    last_probe = now
+                    if not rpc.probe():
+                        log.warning("watchdog: rpc probe failed, recycling signal-cli")
                         break
+                    stale = now - rpc.last_inbound
+                    if stale >= WATCHDOG_STALE:
+                        log.warning("watchdog: no inbound traffic for %ds, recycling signal-cli", int(stale))
+                        break
+                if params is None:
                     continue
                 try:
                     handle(params, rpc)
