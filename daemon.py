@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Queue, Empty
 
@@ -62,6 +63,8 @@ SASUKE_GROUP      = env("SASUKE_GROUP", "").strip()      # base64 groupId; msgs 
 CLAUDE_CONFIG_DIR = env("CLAUDE_CONFIG_DIR", "").strip()  # set → claude runs as the LifeOS DA (Sasuke)
 WATCHDOG_PROBE    = int(env("WATCHDOG_PROBE", "300"))    # seconds between rpc liveness probes
 WATCHDOG_STALE    = int(env("WATCHDOG_STALE", "14400"))  # recycle signal-cli after this long with no inbound traffic
+HTTP_PORT         = int(env("HTTP_PORT", "0"))           # 0 = local send API disabled
+HTTP_HOST         = env("HTTP_HOST", "127.0.0.1")        # loopback only by default
 
 PREFIX_RE = re.compile(
     rf"^{re.escape(TRIGGER_WORD)}@{re.escape(HOSTNAME)}\b[\s:,\-]*",
@@ -156,6 +159,34 @@ class SignalRpc:
         except Empty:
             self.pending.pop(req_id, None)
             return False
+
+    def call(self, method: str, params: dict | None = None, timeout: float = 30.0) -> dict:
+        """Round-trip an arbitrary rpc request. Returns the full response message.
+
+        Raises RuntimeError on dead pipe or timeout so HTTP callers get a 5xx
+        instead of a silent drop.
+        """
+        if not self.proc or not self.proc.stdin or self.proc.poll() is not None:
+            raise RuntimeError("signal-cli not running")
+        waiter: Queue[dict] = Queue(maxsize=1)
+        with self.send_lock:
+            req_id = self.next_id
+            self.next_id += 1
+            self.pending[req_id] = waiter
+            req: dict = {"jsonrpc": "2.0", "method": method, "id": req_id}
+            if params:
+                req["params"] = params
+            try:
+                self.proc.stdin.write(json.dumps(req) + "\n")
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError) as e:
+                self.pending.pop(req_id, None)
+                raise RuntimeError(f"signal-cli pipe dead: {e}") from e
+        try:
+            return waiter.get(timeout=timeout)
+        except Empty:
+            self.pending.pop(req_id, None)
+            raise RuntimeError(f"rpc {method} timed out after {timeout}s")
 
     def send(self, *, recipient: str | None = None, note_to_self: bool = False,
              group_id: str | None = None, message: str) -> None:
@@ -433,8 +464,95 @@ def handle(params: dict, rpc: SignalRpc) -> None:
         rpc.send(recipient=target, message=reply)
 
 
+# --- Local send API ---------------------------------------------------------
+# A loopback HTTP door so local services (e.g. the bullshit-guard confessional)
+# can send through THIS process — the account DB has one lock and we hold it.
+# The rpc object recycles when signal-cli is recycled, so handlers read it from
+# this holder, never from a captured reference.
+_rpc_holder: dict[str, "SignalRpc | None"] = {"rpc": None}
+_groups_cache: dict = {"ts": 0.0, "groups": []}
+
+
+def _list_groups(rpc: "SignalRpc") -> list[dict]:
+    now = time.time()
+    if now - _groups_cache["ts"] < 300 and _groups_cache["groups"]:
+        return _groups_cache["groups"]
+    resp = rpc.call("listGroups")
+    groups = resp.get("result") or []
+    _groups_cache.update(ts=now, groups=groups)
+    return groups
+
+
+class ApiHandler(BaseHTTPRequestHandler):
+    def _reply(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt: str, *args) -> None:  # route to our log, not stderr
+        log.info("[api] " + fmt, *args)
+
+    def do_GET(self) -> None:
+        rpc = _rpc_holder["rpc"]
+        if self.path.rstrip("/") == "/groups":
+            if rpc is None:
+                return self._reply(503, {"error": "signal-cli not ready"})
+            try:
+                groups = [{"id": g.get("id"), "name": g.get("name")} for g in _list_groups(rpc)]
+                return self._reply(200, {"groups": groups})
+            except RuntimeError as e:
+                return self._reply(502, {"error": str(e)})
+        return self._reply(404, {"error": "unknown path"})
+
+    def do_POST(self) -> None:
+        rpc = _rpc_holder["rpc"]
+        if self.path.rstrip("/") != "/send":
+            return self._reply(404, {"error": "unknown path"})
+        if rpc is None:
+            return self._reply(503, {"error": "signal-cli not ready"})
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            req = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return self._reply(400, {"error": "invalid json"})
+        message = req.get("message")
+        if not message or not isinstance(message, str):
+            return self._reply(400, {"error": "message required"})
+        group_id = req.get("groupId")
+        group_name = req.get("groupName")
+        try:
+            if not group_id and group_name:
+                for g in _list_groups(rpc):
+                    if (g.get("name") or "").strip().lower() == group_name.strip().lower():
+                        group_id = g.get("id")
+                        break
+                if not group_id:
+                    return self._reply(404, {"error": f"group not found: {group_name}"})
+            if not group_id:
+                return self._reply(400, {"error": "groupId or groupName required"})
+            resp = rpc.call("send", {"groupId": group_id, "message": message})
+            if "error" in resp:
+                return self._reply(502, {"error": resp["error"]})
+            log.info("[api] sent %d chars to group %s", len(message), group_id[:12])
+            return self._reply(200, {"ok": True, "result": resp.get("result")})
+        except RuntimeError as e:
+            return self._reply(502, {"error": str(e)})
+
+
+def start_api() -> None:
+    if not HTTP_PORT:
+        return
+    server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), ApiHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("send API listening on %s:%d", HTTP_HOST, HTTP_PORT)
+
+
 def main() -> None:
     log.info("=== signal-claw starting ===")
+    start_api()
     while True:
         rpc = SignalRpc()
         try:
@@ -443,6 +561,7 @@ def main() -> None:
             log.exception("failed to spawn signal-cli")
             time.sleep(SIGNAL_RETRY)
             continue
+        _rpc_holder["rpc"] = rpc
 
         try:
             last_probe = time.time()
